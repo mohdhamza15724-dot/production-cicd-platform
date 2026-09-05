@@ -22,40 +22,33 @@ jobs:
 
     steps:
 
-      # 1. Checkout source code
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      # 2. Setup Python
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      # 3. Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. Run automated tests
       - name: Run tests
         run: |
           pytest -v
 
-      # 5. Authenticate to AWS using GitHub OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::342572234760:role/ProductionCICD-GitHubActions-Role
           aws-region: ${{ env.AWS_REGION }}
 
-      # 6. Login to Amazon ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 7. Build Docker image
       - name: Build Docker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -65,7 +58,6 @@ jobs:
             -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             .
 
-      # 8. Push Docker image to ECR
       - name: Push Docker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -74,7 +66,6 @@ jobs:
           docker push \
             $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-      # 9. Deploy to EC2 using AWS Systems Manager
       - name: Deploy to EC2
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -84,23 +75,41 @@ jobs:
           DEPLOY_SCRIPT=$(cat <<EOF
           set -e
 
-          echo "Logging into Amazon ECR..."
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+          echo "========================================"
+          echo "Starting deployment"
+          echo "New image: $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "========================================"
 
-          echo "Pulling image..."
+          echo "Logging into Amazon ECR..."
+
+          aws ecr get-login-password \
+            --region $AWS_REGION | \
+            docker login \
+            --username AWS \
+            --password-stdin $REGISTRY
+
+          echo "Pulling new image..."
+
           docker pull $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-          PREVIOUS_IMAGE=\$(docker inspect --format='{{.Config.Image}}' $CONTAINER_NAME 2>/dev/null || true)
+          echo "Saving currently running image for rollback..."
+
+          PREVIOUS_IMAGE=\$(docker inspect \
+            --format='{{.Config.Image}}' \
+            $CONTAINER_NAME 2>/dev/null || true)
 
           echo "Previous image: \$PREVIOUS_IMAGE"
 
-          echo "Stopping previous container..."
+          echo "Stopping current container..."
+
           docker stop $CONTAINER_NAME 2>/dev/null || true
 
-          echo "Removing previous container..."
+          echo "Removing current container..."
+
           docker rm $CONTAINER_NAME 2>/dev/null || true
 
           echo "Starting new container..."
+
           docker run -d \
             --name $CONTAINER_NAME \
             --restart unless-stopped \
@@ -109,44 +118,86 @@ jobs:
             -e APP_VERSION=$IMAGE_TAG \
             $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-          echo "Waiting for application..."
+          echo "Waiting for application startup..."
+
           sleep 5
 
           echo "Running health check..."
 
-          if curl -f http://127.0.0.1:$CONTAINER_PORT/health; then
+          if curl -f --max-time 10 \
+            http://127.0.0.1:$CONTAINER_PORT/health; then
+
+              echo "========================================"
               echo "Deployment successful!"
+              echo "Application is healthy."
+              echo "========================================"
+
               exit 0
-          fi
 
-          echo "Health check failed!"
-
-          echo "Rolling back..."
-
-          docker stop $CONTAINER_NAME 2>/dev/null || true
-          docker rm $CONTAINER_NAME 2>/dev/null || true
-
-          if [ -n "\$PREVIOUS_IMAGE" ]; then
-              echo "Starting previous image..."
-              docker run -d \
-                --name $CONTAINER_NAME \
-                --restart unless-stopped \
-                -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
-                -e ENVIRONMENT=production \
-                $PREVIOUS_IMAGE
-
-              sleep 5
-
-              if curl -f http://127.0.0.1:$CONTAINER_PORT/health; then
-                  echo "Rollback successful."
-              else
-                  echo "Rollback failed."
-              fi
           else
-              echo "No previous image available for rollback."
+
+              echo "========================================"
+              echo "HEALTH CHECK FAILED!"
+              echo "Starting automatic rollback..."
+              echo "========================================"
+
+              echo "Stopping failed container..."
+
+              docker stop $CONTAINER_NAME 2>/dev/null || true
+
+              echo "Removing failed container..."
+
+              docker rm $CONTAINER_NAME 2>/dev/null || true
+
+              if [ -n "\$PREVIOUS_IMAGE" ]; then
+
+                  echo "Restoring previous image:"
+                  echo "\$PREVIOUS_IMAGE"
+
+                  docker run -d \
+                    --name $CONTAINER_NAME \
+                    --restart unless-stopped \
+                    -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
+                    -e ENVIRONMENT=production \
+                    -e APP_VERSION=rollback \
+                    \$PREVIOUS_IMAGE
+
+                  echo "Waiting for rollback..."
+
+                  sleep 5
+
+                  echo "Checking rolled-back application..."
+
+                  if curl -f --max-time 10 \
+                    http://127.0.0.1:$CONTAINER_PORT/health; then
+
+                      echo "========================================"
+                      echo "ROLLBACK SUCCESSFUL"
+                      echo "Previous version restored and healthy."
+                      echo "========================================"
+
+                  else
+
+                      echo "========================================"
+                      echo "ROLLBACK FAILED"
+                      echo "Manual intervention required."
+                      echo "========================================"
+
+                  fi
+
+              else
+
+                  echo "========================================"
+                  echo "No previous image available."
+                  echo "Cannot perform rollback."
+                  echo "========================================"
+
+              fi
+
+              exit 1
+
           fi
 
-          exit 1
           EOF
           )
 
@@ -178,6 +229,7 @@ jobs:
             echo "Deployment status: $STATUS"
 
             case "$STATUS" in
+
               Success)
                 echo "Deployment completed successfully."
                 exit 0
@@ -191,6 +243,7 @@ jobs:
               *)
                 sleep 5
                 ;;
+
             esac
 
           done
