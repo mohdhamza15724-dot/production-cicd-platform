@@ -9,12 +9,17 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: production-cicd-platform
   EC2_INSTANCE_ID: i-0108259bb1fa2337c
   CONTAINER_NAME: production-cicd
   CONTAINER_PORT: 5000
+  STATE_DIR: /opt/production-cicd
 
 jobs:
   test-build-deploy:
@@ -75,10 +80,34 @@ jobs:
           DEPLOY_SCRIPT=$(cat <<EOF
           set -e
 
+          STATE_DIR="$STATE_DIR"
+          CURRENT_IMAGE_FILE="\$STATE_DIR/current_image"
+          PREVIOUS_IMAGE_FILE="\$STATE_DIR/previous_image"
+
           echo "========================================"
-          echo "Starting deployment"
+          echo "Starting production deployment"
           echo "New image: $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           echo "========================================"
+
+          echo "Preparing deployment state directory..."
+
+          mkdir -p "\$STATE_DIR"
+
+          echo "Checking current deployment state..."
+
+          CURRENT_IMAGE=""
+
+          if [ -f "\$CURRENT_IMAGE_FILE" ]; then
+              CURRENT_IMAGE=\$(cat "\$CURRENT_IMAGE_FILE")
+          fi
+
+          if [ -z "\$CURRENT_IMAGE" ] && docker inspect $CONTAINER_NAME >/dev/null 2>&1; then
+              CURRENT_IMAGE=\$(docker inspect \
+                --format='{{.Config.Image}}' \
+                $CONTAINER_NAME)
+          fi
+
+          echo "Current image: \${CURRENT_IMAGE:-none}"
 
           echo "Logging into Amazon ECR..."
 
@@ -92,13 +121,15 @@ jobs:
 
           docker pull $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-          echo "Saving currently running image for rollback..."
+          echo "Saving rollback state..."
 
-          PREVIOUS_IMAGE=\$(docker inspect \
-            --format='{{.Config.Image}}' \
-            $CONTAINER_NAME 2>/dev/null || true)
-
-          echo "Previous image: \$PREVIOUS_IMAGE"
+          if [ -n "\$CURRENT_IMAGE" ]; then
+              echo "\$CURRENT_IMAGE" > "\$PREVIOUS_IMAGE_FILE"
+              echo "Previous image saved: \$CURRENT_IMAGE"
+          else
+              echo "No previous image available."
+              rm -f "\$PREVIOUS_IMAGE_FILE"
+          fi
 
           echo "Stopping current container..."
 
@@ -127,17 +158,24 @@ jobs:
           if curl -f --max-time 10 \
             http://127.0.0.1:$CONTAINER_PORT/health; then
 
+              echo
               echo "========================================"
-              echo "Deployment successful!"
+              echo "DEPLOYMENT SUCCESSFUL"
               echo "Application is healthy."
               echo "========================================"
+
+              echo "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" > "\$CURRENT_IMAGE_FILE"
+
+              echo "Current image recorded:"
+              cat "\$CURRENT_IMAGE_FILE"
 
               exit 0
 
           else
 
+              echo
               echo "========================================"
-              echo "HEALTH CHECK FAILED!"
+              echo "HEALTH CHECK FAILED"
               echo "Starting automatic rollback..."
               echo "========================================"
 
@@ -149,18 +187,24 @@ jobs:
 
               docker rm $CONTAINER_NAME 2>/dev/null || true
 
-              if [ -n "\$PREVIOUS_IMAGE" ]; then
+              if [ -f "\$PREVIOUS_IMAGE_FILE" ] && [ -s "\$PREVIOUS_IMAGE_FILE" ]; then
+
+                  PREVIOUS_IMAGE=\$(cat "\$PREVIOUS_IMAGE_FILE")
 
                   echo "Restoring previous image:"
                   echo "\$PREVIOUS_IMAGE"
+
+                  docker pull "\$PREVIOUS_IMAGE"
+
+                  PREVIOUS_TAG="\${PREVIOUS_IMAGE##*:}"
 
                   docker run -d \
                     --name $CONTAINER_NAME \
                     --restart unless-stopped \
                     -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
                     -e ENVIRONMENT=production \
-                    -e APP_VERSION=rollback \
-                    \$PREVIOUS_IMAGE
+                    -e APP_VERSION="\$PREVIOUS_TAG" \
+                    "\$PREVIOUS_IMAGE"
 
                   echo "Waiting for rollback..."
 
@@ -171,26 +215,38 @@ jobs:
                   if curl -f --max-time 10 \
                     http://127.0.0.1:$CONTAINER_PORT/health; then
 
+                      echo
                       echo "========================================"
                       echo "ROLLBACK SUCCESSFUL"
                       echo "Previous version restored and healthy."
                       echo "========================================"
 
+                      echo "\$PREVIOUS_IMAGE" > "\$CURRENT_IMAGE_FILE"
+
+                      echo "Current image restored to:"
+                      cat "\$CURRENT_IMAGE_FILE"
+
                   else
 
+                      echo
                       echo "========================================"
                       echo "ROLLBACK FAILED"
                       echo "Manual intervention required."
                       echo "========================================"
 
+                      exit 1
+
                   fi
 
               else
 
+                  echo
                   echo "========================================"
-                  echo "No previous image available."
-                  echo "Cannot perform rollback."
+                  echo "NO PREVIOUS IMAGE AVAILABLE"
+                  echo "Cannot perform automatic rollback."
                   echo "========================================"
+
+                  exit 1
 
               fi
 
@@ -232,11 +288,43 @@ jobs:
 
               Success)
                 echo "Deployment completed successfully."
+
+                echo "========== Deployment Output =========="
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardOutputContent" \
+                  --output text
+
+                echo "========== End Deployment Output =========="
+
                 exit 0
                 ;;
 
               Failed|Cancelled|TimedOut|Cancelling)
+
                 echo "Deployment failed."
+
+                echo "========== Deployment Output =========="
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardOutputContent" \
+                  --output text || true
+
+                echo "========== Deployment Error =========="
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardErrorContent" \
+                  --output text || true
+
                 exit 1
                 ;;
 
