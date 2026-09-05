@@ -1,0 +1,224 @@
+name: Development CI/CD
+
+on:
+  push:
+    branches:
+      - develop
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: development-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: production-cicd-platform
+  EC2_INSTANCE_ID: i-0108259bb1fa2337c
+  CONTAINER_NAME: production-cicd-dev
+  CONTAINER_PORT: 5001
+
+jobs:
+  development-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest -v
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::342572234760:role/ProductionCICD-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            .
+
+      - name: Push Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push \
+            $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy development container
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+
+          DEPLOY_SCRIPT=$(cat <<EOF
+          set -e
+
+          echo "========================================"
+          echo "Starting DEVELOPMENT deployment"
+          echo "Image: $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "========================================"
+
+          echo "Logging into Amazon ECR..."
+
+          aws ecr get-login-password \
+            --region $AWS_REGION | \
+            docker login \
+            --username AWS \
+            --password-stdin $REGISTRY
+
+          echo "Pulling development image..."
+
+          docker pull $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "Stopping existing development container..."
+
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+
+          echo "Removing existing development container..."
+
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+
+          echo "Starting development container..."
+
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --restart unless-stopped \
+            --log-driver=awslogs \
+            --log-opt awslogs-region=$AWS_REGION \
+            --log-opt awslogs-group=/production-cicd/development \
+            --log-opt awslogs-create-group=true \
+            --log-opt awslogs-stream=production-cicd-dev \
+            -p 127.0.0.1:$CONTAINER_PORT:5000 \
+            -e ENVIRONMENT=development \
+            -e APP_VERSION=$IMAGE_TAG \
+            $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "Waiting for application startup..."
+
+          sleep 5
+
+          echo "Running development health check..."
+
+          curl -f --max-time 10 \
+            http://127.0.0.1:$CONTAINER_PORT/health
+
+          echo
+          echo "========================================"
+          echo "DEVELOPMENT DEPLOYMENT SUCCESSFUL"
+          echo "========================================"
+
+          echo "Container:"
+          docker ps --filter "name=$CONTAINER_NAME"
+
+          EOF
+          )
+
+          PARAMS=$(jq -n --arg commands "$DEPLOY_SCRIPT" \
+            '{commands: [$commands]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy development $IMAGE_TAG" \
+            --parameters "$PARAMS" \
+            --region "$AWS_REGION" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          echo "Waiting for development deployment..."
+
+          for i in {1..30}; do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+
+              Success)
+
+                echo "Development deployment completed successfully."
+
+                echo "========== Development Output =========="
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardOutputContent" \
+                  --output text
+
+                echo "========== End Output =========="
+
+                exit 0
+                ;;
+
+              Failed|Cancelled|TimedOut|Cancelling)
+
+                echo "Development deployment failed."
+
+                echo "========== Development Output =========="
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardOutputContent" \
+                  --output text || true
+
+                echo "========== Development Error =========="
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardErrorContent" \
+                  --output text || true
+
+                exit 1
+                ;;
+
+              *)
+
+                sleep 5
+                ;;
+
+            esac
+
+          done
+
+          echo "Development deployment timed out."
+          exit 1
