@@ -144,6 +144,11 @@ jobs:
           docker run -d \
             --name $CONTAINER_NAME \
             --restart unless-stopped \
+            --log-driver=awslogs \
+            --log-opt awslogs-region=$AWS_REGION \
+            --log-opt awslogs-group=/production-cicd/application \
+            --log-opt awslogs-create-group=true \
+            --log-opt awslogs-stream=production-cicd \
             -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
             -e ENVIRONMENT=production \
             -e APP_VERSION=$IMAGE_TAG \
@@ -198,9 +203,16 @@ jobs:
 
                   PREVIOUS_TAG="\${PREVIOUS_IMAGE##*:}"
 
+                  echo "Starting previous image..."
+
                   docker run -d \
                     --name $CONTAINER_NAME \
                     --restart unless-stopped \
+                    --log-driver=awslogs \
+                    --log-opt awslogs-region=$AWS_REGION \
+                    --log-opt awslogs-group=/production-cicd/application \
+                    --log-opt awslogs-create-group=true \
+                    --log-opt awslogs-stream=production-cicd \
                     -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
                     -e ENVIRONMENT=production \
                     -e APP_VERSION="\$PREVIOUS_TAG" \
