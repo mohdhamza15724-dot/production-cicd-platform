@@ -1,0 +1,199 @@
+name: Production CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: production-cicd-platform
+  EC2_INSTANCE_ID: i-0108259bb1fa2337c
+  CONTAINER_NAME: production-cicd
+  CONTAINER_PORT: 5000
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # 1. Checkout source code
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # 2. Setup Python
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. Run automated tests
+      - name: Run tests
+        run: |
+          pytest -v
+
+      # 5. Authenticate to AWS using GitHub OIDC
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::342572234760:role/ProductionCICD-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 6. Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 7. Build Docker image
+      - name: Build Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            .
+
+      # 8. Push Docker image to ECR
+      - name: Push Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push \
+            $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # 9. Deploy to EC2 using AWS Systems Manager
+      - name: Deploy to EC2
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+
+          DEPLOY_SCRIPT=$(cat <<EOF
+          set -e
+
+          echo "Logging into Amazon ECR..."
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+
+          echo "Pulling image..."
+          docker pull $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          PREVIOUS_IMAGE=\$(docker inspect --format='{{.Config.Image}}' $CONTAINER_NAME 2>/dev/null || true)
+
+          echo "Previous image: \$PREVIOUS_IMAGE"
+
+          echo "Stopping previous container..."
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+
+          echo "Removing previous container..."
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+
+          echo "Starting new container..."
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --restart unless-stopped \
+            -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
+            -e ENVIRONMENT=production \
+            -e APP_VERSION=$IMAGE_TAG \
+            $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "Waiting for application..."
+          sleep 5
+
+          echo "Running health check..."
+
+          if curl -f http://127.0.0.1:$CONTAINER_PORT/health; then
+              echo "Deployment successful!"
+              exit 0
+          fi
+
+          echo "Health check failed!"
+
+          echo "Rolling back..."
+
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+
+          if [ -n "\$PREVIOUS_IMAGE" ]; then
+              echo "Starting previous image..."
+              docker run -d \
+                --name $CONTAINER_NAME \
+                --restart unless-stopped \
+                -p 127.0.0.1:$CONTAINER_PORT:$CONTAINER_PORT \
+                -e ENVIRONMENT=production \
+                $PREVIOUS_IMAGE
+
+              sleep 5
+
+              if curl -f http://127.0.0.1:$CONTAINER_PORT/health; then
+                  echo "Rollback successful."
+              else
+                  echo "Rollback failed."
+              fi
+          else
+              echo "No previous image available for rollback."
+          fi
+
+          exit 1
+          EOF
+          )
+
+          PARAMS=$(jq -n --arg commands "$DEPLOY_SCRIPT" \
+            '{commands: [$commands]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy production-cicd $IMAGE_TAG" \
+            --parameters "$PARAMS" \
+            --region "$AWS_REGION" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          echo "Waiting for deployment to finish..."
+
+          for i in {1..30}; do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                echo "Deployment completed successfully."
+                exit 0
+                ;;
+
+              Failed|Cancelled|TimedOut|Cancelling)
+                echo "Deployment failed."
+                exit 1
+                ;;
+
+              *)
+                sleep 5
+                ;;
+            esac
+
+          done
+
+          echo "Deployment timed out waiting for SSM."
+          exit 1
